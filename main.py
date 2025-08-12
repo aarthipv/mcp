@@ -157,6 +157,22 @@ def pg_dump_tool(dbname: str, output_file: str, fmt: str = "t") -> str:
     except subprocess.CalledProcessError as e:
         return f"pg_dump failed: {e}"
 
+# Tool: pg_restore (restores a database from a backup archive)
+PG_RESTORE_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_restore"  # change to your actual path
+
+@mcp.tool()
+def pg_restore_tool(dbname: str, input_file: str) -> str:
+    """Restore PostgreSQL database from a backup file."""
+    try:
+        cmd = [
+            PG_RESTORE_PATH,
+            "-d", dbname,
+            input_file
+        ]
+        subprocess.run(cmd, check=True)
+        return f"Database {dbname} restored from {input_file}"
+    except subprocess.CalledProcessError as e:
+        return f"pg_restore failed: {e}"
 
 
 # Resource: Greeting
