@@ -1,5 +1,41 @@
-from mcp.server.fastmcp import FastMCP
+# from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError:
+    # Fallback: try local import if running from source
+    from fastmcp import FastMCP
 from typing import List
+
+# --- Added for pg_dump/pg_restore tools ---
+import subprocess
+import os
+from typing import Optional
+
+def _run_cmd(cmd: list[str], env: Optional[dict] = None, timeout: int = 600) -> str:
+    """Run a command safely (no shell), capture stdout/stderr, and return a summary string.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env or os.environ.copy(),
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+        output = []
+        output.append(f"$ {' '.join(cmd)}")
+        if proc.stdout:
+            output.append("--- stdout ---\n" + proc.stdout.strip())
+        if proc.stderr:
+            output.append("--- stderr ---\n" + proc.stderr.strip())
+        output.append(f"exit_code={proc.returncode}")
+        return "\n".join(output)
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout}s: {' '.join(cmd)}"
+    except FileNotFoundError:
+        return f"Command not found: {cmd[0]} (is it installed and on PATH?)"
 
 
 # PostgreSQL integration
@@ -101,6 +137,27 @@ def get_leave_history(employee_id: str) -> str:
                 return "Employee ID not found."
     except Exception as e:
         return f"Database error: {e}"
+
+
+# Tool: pg_dump (creates a backup archive)
+PG_DUMP_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_dump"  # change to your actual path
+
+@mcp.tool()
+def pg_dump_tool(dbname: str, output_file: str, fmt: str = "t") -> str:
+    """Run pg_dump to back up a database"""
+    try:
+        cmd = [
+            PG_DUMP_PATH,
+            "-F", fmt,
+            "-f", output_file,
+            dbname
+        ]
+        subprocess.run(cmd, check=True)
+        return f"Backup completed: {output_file}"
+    except subprocess.CalledProcessError as e:
+        return f"pg_dump failed: {e}"
+
+
 
 # Resource: Greeting
 @mcp.resource("greeting://{name}")
