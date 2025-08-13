@@ -10,10 +10,11 @@ from typing import List
 import subprocess
 import os
 from typing import Optional
+import psycopg2
+
 
 def _run_cmd(cmd: list[str], env: Optional[dict] = None, timeout: int = 600) -> str:
-    """Run a command safely (no shell), capture stdout/stderr, and return a summary string.
-    """
+    """Run a command safely (no shell), capture stdout/stderr, and return a summary string."""
     try:
         proc = subprocess.run(
             cmd,
@@ -39,16 +40,33 @@ def _run_cmd(cmd: list[str], env: Optional[dict] = None, timeout: int = 600) -> 
 
 
 # PostgreSQL integration
-import psycopg2
-
 def get_connection():
-    # Replace the placeholders with your actual database credentials
     return psycopg2.connect(
         host="localhost",
         dbname="aarthiprashanth",
         user="aarthiprashanth",
         password=""
     )
+
+# Utility: Disconnect all sessions to a database
+def disconnect_all(dbname, user, host, password):
+    conn = psycopg2.connect(dbname="postgres", user=user, host=host, password=password)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s AND pid <> pg_backend_pid();
+        """, (dbname,))
+    conn.close()
+
+# Utility: Drop a database if exists
+def drop_database(dbname, user, host, password):
+    conn = psycopg2.connect(dbname="postgres", user=user, host=host, password=password)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(f'DROP DATABASE IF EXISTS "{dbname}";')
+    conn.close()
 
 # Create MCP server
 mcp = FastMCP("LeaveManager")
@@ -70,16 +88,13 @@ def get_leave_balance(employee_id: str) -> str:
     except Exception as e:
         return f"Database error: {e}"
 
-# Tool: Apply for Leave with specific dates
+# Tool: Apply for Leave
 @mcp.tool()
 def apply_leave(employee_id: str, leave_dates: List[str]) -> str:
-    """
-    Apply leave for specific dates (e.g., ["2025-04-17", "2025-05-01"])
-    """
+    """Apply leave for specific dates"""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        # Check current balance
         cur.execute("SELECT balance FROM employee_leaves WHERE emp_id = %s", (employee_id,))
         row = cur.fetchone()
         if not row:
@@ -92,10 +107,8 @@ def apply_leave(employee_id: str, leave_dates: List[str]) -> str:
             cur.close()
             conn.close()
             return f"Insufficient leave balance. You requested {requested_days} day(s) but have only {available_balance}."
-        # Deduct balance
         new_balance = available_balance - requested_days
         cur.execute("UPDATE employee_leaves SET balance = %s WHERE emp_id = %s", (new_balance, employee_id))
-        # Insert leave dates into leave_history
         for date in leave_dates:
             cur.execute(
                 "INSERT INTO leave_history (emp_id, leave_date) VALUES (%s, %s)",
@@ -108,8 +121,7 @@ def apply_leave(employee_id: str, leave_dates: List[str]) -> str:
     except Exception as e:
         return f"Database error: {e}"
 
-
-# Resource: Leave history
+# Tool: Leave history
 @mcp.tool()
 def get_leave_history(employee_id: str) -> str:
     """Get leave history for the employee"""
@@ -124,7 +136,6 @@ def get_leave_history(employee_id: str) -> str:
             history = ', '.join(row[0].strftime("%Y-%m-%d") for row in rows)
             return f"Leave history for {employee_id}: {history}"
         else:
-            # Check if employee exists
             conn = get_connection()
             cur = conn.cursor()
             cur.execute("SELECT 1 FROM employee_leaves WHERE emp_id = %s", (employee_id,))
@@ -138,42 +149,105 @@ def get_leave_history(employee_id: str) -> str:
     except Exception as e:
         return f"Database error: {e}"
 
-
-# Tool: pg_dump (creates a backup archive)
-PG_DUMP_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_dump"  # change to your actual path
+# Tool: pg_dump
+PG_DUMP_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_dump"
 
 @mcp.tool()
 def pg_dump_tool(dbname: str, output_file: str, fmt: str = "t") -> str:
     """Run pg_dump to back up a database"""
     try:
-        cmd = [
-            PG_DUMP_PATH,
-            "-F", fmt,
-            "-f", output_file,
-            dbname
-        ]
+        cmd = [PG_DUMP_PATH, "-F", fmt, "-f", output_file, dbname]
         subprocess.run(cmd, check=True)
         return f"Backup completed: {output_file}"
     except subprocess.CalledProcessError as e:
         return f"pg_dump failed: {e}"
 
-# Tool: pg_restore (restores a database from a backup archive)
-PG_RESTORE_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_restore"  # change to your actual path
+# Tool: pg_restore with auto disconnect + drop
+PG_RESTORE_PATH = "/Applications/Postgres.app/Contents/Versions/latest/bin/pg_restore"
 
 @mcp.tool()
-def pg_restore_tool(dbname: str, input_file: str) -> str:
-    """Restore PostgreSQL database from a backup file."""
-    try:
-        cmd = [
-            PG_RESTORE_PATH,
-            "-d", dbname,
-            input_file
-        ]
-        subprocess.run(cmd, check=True)
-        return f"Database {dbname} restored from {input_file}"
-    except subprocess.CalledProcessError as e:
-        return f"pg_restore failed: {e}"
+def pg_restore_tool(
+    archive_file: str,
+    target_db: str,
+    user: str = "aarthiprashanth",
+    host: str = "localhost",
+    port: int = 5432,
+    clean: bool = False,   # --clean
+    create: bool = False,  # -C (create DB)
+    verbose: bool = True,  # -v
+    password: str = "",
+    extra_args: List[str] = [],
+) -> str:
+    """Run pg_restore to restore an archive.
 
+    Args:
+        archive_file: Path to the dump archive produced by pg_dump.
+        target_db: Database to restore into (ignored if create=True with -C; pass 'postgres').
+        clean: Drop objects before recreating them.
+        create: Recreate the database from the archive (-C). If True, set target_db to a maintenance DB like 'postgres'.
+        verbose: Show verbose output.
+        password: Optional password (set via env; not echoed).
+        extra_args: Additional pg_restore flags.
+    Returns: Combined stdout/stderr and exit code.
+    """
+    cmd = [
+        PG_RESTORE_PATH,
+        "-h", host,
+        "-p", str(port),
+        "-U", user,
+    ]
+    if clean:
+        cmd.append("--clean")
+    if create:
+        cmd.append("-C")
+    if verbose:
+        cmd.append("-v")
+    cmd.extend(["-d", target_db, archive_file])
+    if extra_args:
+        cmd.extend(extra_args)
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+    return _run_cmd(cmd, env=env)
+
+@mcp.tool()
+def pg_restore_tool(
+    archive_file: str,
+    target_db: str,
+    user: str = "aarthiprashanth",
+    host: str = "localhost",
+    port: int = 5432,
+    clean: bool = False,
+    create: bool = False,
+    verbose: bool = True,
+    password: str = "",
+    auto_drop: bool = True,
+    extra_args: List[str] = [],
+) -> str:
+    """
+    Restores from an archive, optionally disconnecting users and dropping the DB first.
+    """
+    try:
+        if auto_drop and create:
+            disconnect_all(target_db, user, host, password)
+            drop_database(target_db, user, host, password)
+
+        cmd = [PG_RESTORE_PATH, "-h", host, "-p", str(port), "-U", user]
+        if clean:
+            cmd.append("--clean")
+        if create:
+            cmd.append("-C")
+        if verbose:
+            cmd.append("-v")
+        cmd.extend(["-d", target_db, archive_file])
+        if extra_args:
+            cmd.extend(extra_args)
+        env = os.environ.copy()
+        if password:
+            env["PGPASSWORD"] = password
+        return _run_cmd(cmd, env=env)
+    except Exception as e:
+        return f"Restore error: {e}"
 
 # Resource: Greeting
 @mcp.resource("greeting://{name}")
